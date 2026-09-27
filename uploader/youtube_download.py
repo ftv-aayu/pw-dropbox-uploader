@@ -21,8 +21,16 @@ def download_youtube_video(url, filename=None):
     ydl_opts = {
         'proxy': 'socks5://127.0.0.1:40000',
         'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
-        'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+        # Pick the best video + best audio regardless of codec/container,
+        # then remux/transcode everything into mp4 via FFmpeg.
+        # The old "[ext=mp4]" constraint was locking us to 360p because
+        # YouTube's high-quality streams (720p+) are webm/VP9, not mp4.
+        'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
+        'postprocessors': [{
+            'key': 'FFmpegVideoConvertor',
+            'preferedformat': 'mp4',
+        }],
         'outtmpl': outtmpl,
         'quiet': False,
         'no_warnings': False,
