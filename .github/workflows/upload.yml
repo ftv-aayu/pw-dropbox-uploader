@@ -1,91 +1,114 @@
 name: Upload Files
 
+# ── Triggers ──────────────────────────────────────────────────────────────────
+# • Daily at midnight UTC (automatic).
+# • Manual dispatch with an optional source override.
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 0 * * *"
+    inputs:
+      source:
+        description: "Download source"
+        required: false
+        default: "url"
+        type: choice
+        options: [url, drive]
 
+  schedule:
+    - cron: "0 0 * * *"   # daily at 00:00 UTC
+
+# ── Job ───────────────────────────────────────────────────────────────────────
 jobs:
   upload:
     runs-on: ubuntu-latest
+    timeout-minutes: 300    # 5-hour hard cap; prevents zombie runs
+
     steps:
+      # ── 1. Checkout ─────────────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      # ── 2. Python ───────────────────────────────────────────────────────────
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      # 1. Install ONLY the requirement needed to check jobs
-      - name: Install requests
-        run: pip install requests
+      # ── 3. Early-exit: check queue BEFORE heavy installs ────────────────────
+      #    Only installs `requests` so the check is fast.
+      - name: Install requests (queue check only)
+        run: pip install --quiet requests
 
-      # 2. Check for jobs BEFORE heavy installations
-      - name: Check for jobs
+      - name: Check for pending jobs
         id: check_jobs
         working-directory: uploader
         run: |
           RESULT=$(python jobs.py)
+          echo "Queue result: $RESULT"
           if [ "$RESULT" = "true" ]; then
-            echo "Jobs found. Proceeding with workflow..."
-            echo "has_jobs=true" >> $GITHUB_OUTPUT
+            echo "has_jobs=true"  >> $GITHUB_OUTPUT
           else
-            echo "No jobs in queue. Halting execution gracefully."
+            echo "No jobs in queue — stopping gracefully."
             echo "has_jobs=false" >> $GITHUB_OUTPUT
           fi
 
-      # 3. NEW FIX: Install and start Cloudflare WARP Proxy
-      - name: Setup Cloudflare WARP Proxy
+      # ── 4. System packages (single apt-get update) ──────────────────────────
+      - name: Install system packages (Cloudflare WARP + FFmpeg)
         if: steps.check_jobs.outputs.has_jobs == 'true'
         run: |
-          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
-          sudo apt-get update
-          sudo apt-get install -y cloudflare-warp
+          # Add Cloudflare WARP repo
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+            | sudo gpg --yes --dearmor \
+              --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+
+          echo "deb [arch=amd64 signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
+            https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+            | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
+
+          # Single update installs both packages
+          sudo apt-get update -qq
+          sudo apt-get install -y cloudflare-warp ffmpeg
+
+          # Start WARP proxy
           warp-cli --accept-tos registration new
           warp-cli --accept-tos mode proxy
           warp-cli --accept-tos connect
-          sleep 5 # Give the proxy a few seconds to connect
+          sleep 5
 
-      # 4. Install FFmpeg
-      - name: Install FFmpeg
+      # ── 5. Python dependencies ───────────────────────────────────────────────
+      - name: Install Python dependencies
         if: steps.check_jobs.outputs.has_jobs == 'true'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip --quiet
+          pip install --quiet -r uploader/requirements.txt
+          pip install --quiet -U yt-dlp
 
-      # 5. Install dependencies (Added yt-dlp explicitly)
-      - name: Install dependencies
+      # ── 6. Write Firebase credentials from secret ────────────────────────────
+      #    Using echo + single quotes avoids heredoc edge-cases with special chars.
+      - name: Write Firebase credentials
         if: steps.check_jobs.outputs.has_jobs == 'true'
+        env:
+          FIREBASE_JSON: ${{ secrets.FIREBASE_JSON }}
         run: |
-          python -m pip install --upgrade pip
-          pip install -r uploader/requirements.txt
-          pip install -U yt-dlp
+          echo "$FIREBASE_JSON" > uploader/firebase.json
 
-      - name: Create Firebase Credentials
-        if: steps.check_jobs.outputs.has_jobs == 'true'
-        run: |
-          cat > uploader/firebase.json << 'EOF'
-          ${{ secrets.FIREBASE_JSON }}
-          EOF
-      
-      # 6. Final step cleanly executes logic
+      # ── 7. Run uploader ──────────────────────────────────────────────────────
       - name: Run uploader
         if: steps.check_jobs.outputs.has_jobs == 'true'
         working-directory: uploader
         env:
-          PW_TOKEN: ${{ secrets.PW_TOKEN }}
+          PW_TOKEN:       ${{ secrets.PW_TOKEN }}
           GDRIVE_API_KEY: ${{ secrets.GDRIVE_API_KEY }}
-          DOWNLOAD_SOURCE: url
+          # Manual dispatch uses the selected input; scheduled runs default to "url"
+          DOWNLOAD_SOURCE: ${{ github.event.inputs.source || 'url' }}
         run: |
+          echo "Source: $DOWNLOAD_SOURCE"
           if [ "$DOWNLOAD_SOURCE" = "drive" ]; then
-            echo "Using Google Drive source..."
             python upload_from_gdrive.py
-          elif [ "$DOWNLOAD_SOURCE" = "url" ]; then
-            echo "Using Direct URL source..."
-            python upload_from_url.py
           else
-            echo "Unknown DOWNLOAD_SOURCE: $DOWNLOAD_SOURCE"
-            exit 1
+            python upload_from_url.py
           fi
+
+      # ── 8. Always clean up credentials ──────────────────────────────────────
+      - name: Remove Firebase credentials
+        if: always()
+        run: rm -f uploader/firebase.json
