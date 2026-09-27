@@ -20,11 +20,14 @@ def download_youtube_video(url, filename=None):
     # 3. Merge best video and audio into an mp4 container
     ydl_opts = {
         'proxy': 'socks5://127.0.0.1:40000',
-        'extractor_args': {'youtube': {'player_client': ['ios', 'android']}},
-        # Pick the best video + best audio regardless of codec/container,
-        # then remux/transcode everything into mp4 via FFmpeg.
-        # The old "[ext=mp4]" constraint was locking us to 360p because
-        # YouTube's high-quality streams (720p+) are webm/VP9, not mp4.
+        'extractor_args': {
+            'youtube': {
+                # tv_embedded + web are not affected by the SABR-only experiment
+                # that blocks URL extraction on ios/android clients.
+                # See: https://github.com/yt-dlp/yt-dlp/issues/12482
+                'player_client': ['tv_embedded', 'web'],
+            }
+        },
         'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'postprocessors': [{
