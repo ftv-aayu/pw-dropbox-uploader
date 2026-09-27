@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import mimetypes
 import subprocess
 import tempfile
 import urllib.parse
@@ -14,6 +15,7 @@ from tqdm import tqdm
 # ==========================================
 
 def _filename_from_response(response, url):
+    # 1. Try Content-Disposition header first (most reliable)
     cd = response.headers.get("content-disposition", "")
     if cd:
         m = re.search(r"filename\*\s*=\s*([^']*)''([^;]+)", cd, re.I)
@@ -25,7 +27,20 @@ def _filename_from_response(response, url):
         m = re.search(r'filename\s*=\s*([^;]+)', cd, re.I)
         if m:
             return m.group(1).strip("\"' ")
+
+    # 2. Try to get a name from the URL path
     name = os.path.basename(url.split("?", 1)[0])
+
+    # 3. If the name has no extension (e.g. "/stream"), derive one from Content-Type
+    if name and not os.path.splitext(name)[1]:
+        ct = response.headers.get("content-type", "").split(";")[0].strip()
+        ext = mimetypes.guess_extension(ct) if ct else None
+        # guess_extension returns things like ".mp4", ".jpeg" — clean up known quirks
+        _EXT_FIX = {".jpe": ".jpg", ".jpeg": ".jpg", ".mpga": ".mp3"}
+        if ext:
+            ext = _EXT_FIX.get(ext, ext)
+            name = name + ext
+
     return name or "download.bin"
 
 def extract_nested_headers(url_string):
